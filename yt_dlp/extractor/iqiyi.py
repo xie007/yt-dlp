@@ -38,6 +38,18 @@ class IqiyiIE(InfoExtractor):
     _VALID_URL = r'https?://(?:(?:[^.]+\.)?iqiyi\.com|www\.pps\.tv)/.+\.html'
 
     _TESTS = [{
+        'url': 'https://www.iqiyi.com/v_19rrkhw0rc.html',
+        'info_dict': {
+            'id': '429054900',
+            'display_id': '19rrkhw0rc',
+            'ext': 'mp4',
+            'title': '末路1997第13集',
+        },
+        'params': {
+            'format': '100',
+            'test': True,
+        },
+    }, {
         'url': 'http://www.iqiyi.com/v_19rrojlavg.html',
         # MD5 checksum differs on my machine and Travis CI
         'info_dict': {
@@ -45,6 +57,7 @@ class IqiyiIE(InfoExtractor):
             'ext': 'mp4',
             'title': '美国德州空中惊现奇异云团 酷似UFO',
         },
+        'skip': 'Video no longer available',
     }, {
         'url': 'http://www.iqiyi.com/v_19rrhnnclk.html',
         'md5': 'b7dc800a4004b1b57749d9abae0472da',
@@ -68,6 +81,7 @@ class IqiyiIE(InfoExtractor):
             'ext': 'mp4',
             'title': '第2017-04-21期 女艺人频遭极端粉丝骚扰',
         },
+        'skip': 'Page no longer provides video data',
     }, {
         # VIP-only video. The first 2 parts (6 minutes) are available without login
         # MD5 sums omitted as values are different on Travis CI and my machine
@@ -85,6 +99,7 @@ class IqiyiIE(InfoExtractor):
             'title': '灌篮高手 国语版',
         },
         'playlist_count': 101,
+        'skip': 'Page no longer provides video data',
     }, {
         'url': 'http://www.pps.tv/w_19rrbav0ph.html',
         'only_matching': True,
@@ -100,6 +115,133 @@ class IqiyiIE(InfoExtractor):
         '5': 6,     # 1072p, 1080p
         '18': 7,    # 1080p
     }
+
+    _BID_TAGS = {
+        '100': '240P',
+        '200': '360P',
+        '300': '480P',
+        '500': '720P',
+        '600': '1080P',
+    }
+
+    @staticmethod
+    def _decode_tvid(url):
+        slug = re.search(r'/v_([0-9a-z]+)\.html(?:$|[?#])', url)
+        if not slug:
+            return
+        tvid = int(slug.group(1), 36) ^ 0x75706971676c
+        if tvid < 900000:
+            tvid = 100 * (tvid + 900000)
+        return str(tvid)
+
+    @staticmethod
+    def _sign_dash_path(path):
+        suffix = ''.join(
+            chr(r + (48 if r < 9 else 88))
+            for t in range(4) for i in range(2) for n in range(4)
+            for r in [(70 * t + 677 * i + 21 * n + 87 * t * i * n + 59) % 30])
+        return md5_text(path + suffix)
+
+    def _download_dash_data(self, tvid, bid, vid, tm, k_uid):
+        params = {
+            'tvid': tvid,
+            'bid': bid,
+            'ds': '1',
+            'vid': vid,
+            'src': '01010031010000000000',
+            'vt': '0',
+            'rs': '1',
+            'uid': '',
+            'ori': 'pcw',
+            'ps': '1',
+            'k_uid': k_uid,
+            'pt': '0',
+            'd': '0',
+            's': '',
+            'lid': '0',
+            'cf': '0',
+            'ct': '0',
+            'authKey': md5_text(md5_text('') + tm + tvid),
+            'k_tag': '1',
+            'dfp': '',
+            'locale': 'zh_cn',
+            'up': '',
+            'qd_v': 'a1',
+            'tm': tm,
+            'sr': '1',
+            'k_ft4': '4',
+            'ut': '0',
+        }
+        path = '/dash?' + urllib.parse.urlencode(params)
+        params['vf'] = self._sign_dash_path(path)
+        return self._download_json(
+            'https://cache.video.iqiyi.com/dash', tvid,
+            query=params, headers={**self.geo_verification_headers(), 'Referer': 'https://www.iqiyi.com/'}, fatal=False)
+
+    def _extract_modern(self, url, webpage, tvid):
+        video_info = self._download_json(
+            'https://mesh.if.iqiyi.com/player/pcw/video/playervideoinfo', tvid,
+            query={'id': tvid, 'locale': 'cn_s'},
+            headers={**self.geo_verification_headers(), 'Referer': 'https://www.iqiyi.com/'}, fatal=False)
+        title = traverse_obj(video_info, ('data', 'vn'), expected_type=str)
+        title = title or get_element_by_id('widget-videotitle', webpage) or clean_html(
+            get_element_by_attribute('class', 'mod-play-tit', webpage)) or self._og_search_title(webpage, default=None)
+
+        tm = str(int(time.time() * 1000))
+        k_uid_cookie = self._get_cookies('https://www.iqiyi.com').get('QC005')
+        k_uid = k_uid_cookie.value if k_uid_cookie else md5_text(tm + tvid)
+
+        initial_data = self._download_dash_data(tvid, '0', '', tm, k_uid)
+        data = traverse_obj(initial_data, 'data', expected_type=dict) or {}
+        videos = traverse_obj(data, ('program', 'video', ...), expected_type=dict)
+        if not videos and int_or_none(data.get('st')) == 502:
+            self.raise_geo_restricted(countries=['CN'])
+        if not videos and int_or_none(data.get('st')) == 501:
+            raise ExtractorError('Video is no longer available', expected=True)
+        if not initial_data or initial_data.get('code') != 'A00000':
+            code = traverse_obj(initial_data, 'code', expected_type=str)
+            if code == 'A00111':
+                self.raise_geo_restricted(countries=['CN'])
+            raise ExtractorError(f'Unable to load iQiyi video data{f": {code}" if code else ""}')
+
+        videos_by_bid = {}
+        for video in videos:
+            bid = str_or_none(video.get('bid'))
+            if bid in self._BID_TAGS and video.get('ff') in (None, 'ts', '265ts'):
+                videos_by_bid.setdefault(bid, video)
+
+        formats = []
+        for bid in sorted(videos_by_bid, key=lambda item: list(self._BID_TAGS).index(item)):
+            video_format = videos_by_bid[bid]
+            m3u8 = video_format.get('m3u8')
+            if not m3u8:
+                format_data = self._download_dash_data(
+                    tvid, bid, str_or_none(video_format.get('vid')) or '', tm, k_uid)
+                format_videos = traverse_obj(format_data, ('data', 'program', 'video', ...), expected_type=dict)
+                video_format = next((item for item in format_videos if str_or_none(item.get('bid')) == bid), {})
+                m3u8 = video_format.get('m3u8')
+            if not isinstance(m3u8, str) or '#EXTM3U' not in m3u8:
+                continue
+
+            extracted_formats, _ = self._parse_m3u8_formats_and_subtitles(
+                m3u8, ext='mp4', m3u8_id=bid, fatal=False, video_id=tvid)
+            for f in extracted_formats:
+                f.update({
+                    'quality': list(self._BID_TAGS).index(bid),
+                    'format_note': self._BID_TAGS[bid],
+                    'http_headers': {'Referer': 'https://www.iqiyi.com/'},
+                    **parse_resolution(video_format.get('scrsz')),
+                })
+            formats.extend(extracted_formats)
+
+        if not formats:
+            raise ExtractorError('Unable to extract iQiyi video formats')
+        return {
+            'id': tvid,
+            'display_id': re.search(r'/v_([0-9a-z]+)\.html', url).group(1),
+            'title': title or tvid,
+            'formats': formats,
+        }
 
     def get_raw_data(self, tvid, video_id):
         tm = int(time.time() * 1000)
@@ -162,6 +304,9 @@ class IqiyiIE(InfoExtractor):
         tvid = self._search_regex(
             r'data-(?:player|shareplattrigger)-tvid\s*=\s*[\'"](\d+)', webpage, 'tvid', default=None)
         if tvid is None:
+            tvid = self._decode_tvid(url)
+            if tvid:
+                return self._extract_modern(url, webpage, tvid)
             playlist_result = self._extract_playlist(webpage)
             if playlist_result:
                 return playlist_result
